@@ -19,11 +19,16 @@ Checked on an X1 with firmware 40.140.003.01.ht18.
 
 from __future__ import annotations
 
+import contextlib
 import logging
+from collections.abc import AsyncIterator
 from typing import Any
+
+import aiohttp
 
 from ...const import XtoolStatus
 from ..base import XtoolDeviceState
+from .protocol import WSV2_PATH, _CLIENT_SESSION_ID, _decode_frames, _ssl_context
 from .protocol_m2 import (
     M2_PATH_CONFIG,
     M2_PATH_COORDINATE,
@@ -48,6 +53,11 @@ X1_PATH_LASER_BAG = "/v1/project/peripheral/laserbag-info"
 X1_PATH_PRINTHEAD = "/v1/project/printhead/printhead-status"
 X1_PATH_WIFI = "/v1/platform/wifi/connected-info"
 X1_PATH_ALARM_RECORDS = "/v1/project/alarm/records"
+X1_PATH_CAMERA_LIVE = "/v1/platform/camera/live"
+
+# Protocol type of the frames on the ``media_stream`` socket (Studio's
+# ProtocolCode MEDIA_STREAM): their payload is the H.264 video.
+MEDIA_STREAM_FRAME = 34
 
 # Every setting Studio's X1 extension reads (its ``getConfigs`` key list).
 X1_SETTINGS = (
@@ -137,6 +147,10 @@ def _flag(value: Any) -> bool:
     return bool(value)
 
 
+class LiveVideoBusy(RuntimeError):
+    """Another camera of the laser is live: it streams one at a time."""
+
+
 class X1WSV2Protocol(M2WSV2Protocol):
     """The X1: the platform 2.0 interface with the X1's own hardware."""
 
@@ -160,6 +174,8 @@ class X1WSV2Protocol(M2WSV2Protocol):
     def __init__(self, host: str, port: int | None = None) -> None:
         super().__init__(host, port)
         self._x1_poll_counter = 0
+        # The camera whose live video runs, if one does
+        self._live_camera: str | None = None
 
     # --- Polling -----------------------------------------------------------
 
@@ -261,6 +277,55 @@ class X1WSV2Protocol(M2WSV2Protocol):
             for key in keys:
                 if isinstance(reply.get(key), str):
                     self._latest[field] = reply[key] == "block"
+
+    # --- Live video ------------------------------------------------------------
+
+    async def live_video(self, camera_name: str) -> AsyncIterator[bytes]:
+        """The camera's live video, as Studio's live monitor gets it.
+
+        ``POST /v1/platform/camera/live`` ``action=start``, then H.264
+        (Annex B, about 10-20 frames a second) in the frames of the
+        ``media_stream`` socket, each after one byte (0 with the far
+        camera's pictures, 1 with the near one's); ``action=stop`` when
+        the caller is done.
+        One camera at a time: the X1 has one media socket per client, and
+        a second one closes the first. Raises :class:`LiveVideoBusy`
+        while another camera is live.
+        """
+        if self._live_camera is not None:
+            raise LiveVideoBusy(self._live_camera)
+        if not self._connected or self._session is None:
+            await self.connect()
+        self._live_camera = camera_name
+        url = (
+            f"wss://{self.host}:{self._port}{WSV2_PATH}"
+            f"?id={_CLIENT_SESSION_ID}&function=media_stream"
+        )
+        try:
+            async with self._session.ws_connect(
+                url, ssl=_ssl_context(), timeout=aiohttp.ClientTimeout(total=15),
+                heartbeat=None, max_msg_size=0,
+            ) as ws:
+                await self.request(
+                    X1_PATH_CAMERA_LIVE, "POST", params={"name": camera_name, "action": "start"},
+                )
+                try:
+                    buffer = b""
+                    async for message in ws:
+                        if message.type != aiohttp.WSMsgType.BINARY:
+                            break
+                        frames, buffer = _decode_frames(buffer + message.data)
+                        for frame_type, payload in frames:
+                            if frame_type == MEDIA_STREAM_FRAME and len(payload) > 1:
+                                yield payload[1:]
+                finally:
+                    with contextlib.suppress(Exception):
+                        await self.request(
+                            X1_PATH_CAMERA_LIVE, "POST",
+                            params={"name": camera_name, "action": "stop"},
+                        )
+        finally:
+            self._live_camera = None
 
     # --- Writes ------------------------------------------------------------
 

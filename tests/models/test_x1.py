@@ -10,7 +10,9 @@ change reached the X1.
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import AsyncIterator
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -22,6 +24,8 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.xtool.const import DOMAIN, XtoolStatus
 from custom_components.xtool.protocols import DEVICE_MODELS, detect_models
 from custom_components.xtool.protocols.base import XtoolDeviceState
+from custom_components.xtool.protocols.ws_v2.live_video import LiveVideo
+from custom_components.xtool.protocols.ws_v2.protocol_x1 import LiveVideoBusy
 
 from .x1_capture import (
     FILL_LIGHT_REPORT,
@@ -413,3 +417,98 @@ async def test_a_light_shows_its_new_value(hass: HomeAssistant, x1) -> None:
     )
     state = hass.states.get(entity_id("light.fill_light_near"))
     assert (state.state, state.attributes["brightness"]) == ("on", 51)
+
+
+# --- Live video -----------------------------------------------------------
+
+
+def _h264_access_units(count: int = 12) -> list[bytes]:
+    """A short H.264 stream (Annex B), one access unit per item."""
+    import fractions
+
+    import av
+    import numpy as np
+
+    encoder = av.CodecContext.create("libx264", "w")
+    encoder.width, encoder.height, encoder.pix_fmt = 64, 48, "yuv420p"
+    encoder.time_base = fractions.Fraction(1, 10)
+    encoder.options = {"tune": "zerolatency"}
+    units = []
+    for index in range(count):
+        frame = av.VideoFrame.from_ndarray(
+            np.full((48, 64, 3), index * 20, dtype=np.uint8), format="rgb24",
+        ).reformat(format="yuv420p")
+        frame.pts = index
+        units += [bytes(packet) for packet in encoder.encode(frame)]
+    return units + [bytes(packet) for packet in encoder.encode(None)]
+
+
+def _media_frame(payload: bytes) -> bytes:
+    """A ``media_stream`` frame as the X1 sends it: protocol type 34, no payload CRC."""
+    from custom_components.xtool.protocols.ws_v2 import protocol as ws_v2
+
+    header = b"\xba\xbe" + len(payload).to_bytes(3, "big") + bytes([0x80 | 34]) + b"\x00\x00"
+    return header + ws_v2._crc16(header).to_bytes(2, "big") + payload
+
+
+class _MediaSocket:
+    def __init__(self, messages: list[bytes]) -> None:
+        self._messages = messages
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc) -> bool:
+        return False
+
+    async def __aiter__(self):
+        import aiohttp
+
+        for data in self._messages:
+            yield SimpleNamespace(type=aiohttp.WSMsgType.BINARY, data=data)
+
+
+class _MediaSession:
+    """Opens the media socket; its messages are the frames given."""
+
+    def __init__(self, messages: list[bytes]) -> None:
+        self.messages = messages
+        self.urls: list[str] = []
+
+    def ws_connect(self, url: str, **kwargs) -> _MediaSocket:
+        self.urls.append(url)
+        return _MediaSocket(self.messages)
+
+
+@pytest.mark.parametrize(("camera", "stream_byte"), [("far", b"\x00"), ("near", b"\x01")])
+async def test_live_video_from_the_media_socket(hass: HomeAssistant, camera: str, stream_byte: bytes) -> None:
+    """Studio's live monitor: camera/live start, H.264 on the media socket, stop."""
+    protocol = _protocol()
+    units = _h264_access_units()
+    # One frame split over two messages: the frames are put back together
+    first = _media_frame(stream_byte + units[0])
+    messages = [first[:7], first[7:], *(_media_frame(stream_byte + unit) for unit in units[1:])]
+    protocol._session = _MediaSession(messages)
+    video = LiveVideo(hass, lambda: protocol.live_video(camera), f"{camera} camera", fps=1000)
+    async with contextlib.aclosing(video.frames()) as frames:
+        jpegs = [jpeg async for jpeg in frames]
+    assert len(jpegs) >= len(units) - 2
+    assert all(jpeg.startswith(b"\xff\xd8") for jpeg in jpegs)
+    assert "function=media_stream" in protocol._session.urls[0]
+    assert [(params, data) for method, url, params, data in protocol.sent if url == "/v1/platform/camera/live"] == [
+        ({"name": camera, "action": "start"}, None),
+        ({"name": camera, "action": "stop"}, None),
+    ]
+
+
+async def test_one_camera_live_at_a_time() -> None:
+    protocol = _protocol()
+    protocol._session = _MediaSession([_media_frame(b"\x00" + unit) for unit in _h264_access_units(3)])
+    far = protocol.live_video("far")
+    await far.__anext__()
+    with pytest.raises(LiveVideoBusy):
+        await protocol.live_video("near").__anext__()
+    await far.aclose()
+    near = protocol.live_video("near")
+    assert await near.__anext__()
+    await near.aclose()

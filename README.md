@@ -243,7 +243,7 @@ data:
 
 ### Camera
 
-On a laser with several cameras, each camera and its settings have their own device, connected to the laser. Cameras on V2 firmware have no live video: their live view is built from photos (about 2.5 per second), and their state is Streaming while one is open.
+On a laser with several cameras, each camera and its settings have their own device, connected to the laser. Cameras on V2 firmware have no live video: their live view is built from photos (about 2.5 per second), and their state is Streaming while one is open. The **X1** has: its live view is the laser's own video (decoded to about 10 pictures a second), from one camera at a time, as in Studio; while one camera is live, the other's live view is built from photos.
 
 | Entity | Description |
 |---|---|

@@ -173,6 +173,11 @@ class XtoolDeviceModel:
     # - P2 / P2S / P3                → ``("overview", "closeup")``
     #   (V1 legacy naming carried through to their V2 variant).
     camera_names: tuple[str, ...] = ()
+    # The live view is the laser's own video (the X1: H.264 on the
+    # ``media_stream`` socket after ``/v1/platform/camera/live``), one
+    # camera at a time; the other cameras' live view stays built from
+    # photos meanwhile.
+    has_live_video: bool = False
     # The laser stores a calibration grid for its ``main`` camera
     # (``global_calib.json``); photos are straightened with it, as
     # Studio does (F2 Ultra UV).

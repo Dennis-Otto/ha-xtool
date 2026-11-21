@@ -17,6 +17,7 @@ for the V1 REST equivalents whose patterns we mirror.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from datetime import timedelta
 from functools import partial
@@ -81,6 +82,7 @@ from ...entity import (
 from ...event import XtoolEvent
 from ...sensor import XtoolSensor, XtoolSensorEntityDescription
 from ...update import XtoolFirmwareUpdate
+from .live_video import LiveVideo
 from .camera_correction import (
     CALIBRATED_AREA_MM,
     CameraCalibration,
@@ -2239,13 +2241,15 @@ class _WSV2CameraViewNumber(_CameraDeviceEntity, RestoreNumber):
 class _WSV2Camera(_CameraDeviceEntity, Camera):
     """V2 camera: one entity per lens, built from still photos.
 
-    These lasers have no live video (the firmware answers
+    Most of these lasers have no live video (the firmware answers
     ``/v1/platform/camera/live`` with "camera disabled", and Studio
     only takes photos), so both the still image
     (``async_camera_image``) and the live view
     (``handle_async_mjpeg_stream``, a multipart MJPEG stream) come from
     ``/v1/camera/snap?name=<n>``. Both share one photo cache, so
-    thumbnails and live viewers do not each ask the laser.
+    thumbnails and live viewers do not each ask the laser. On a model
+    with ``has_live_video`` (the X1) the live view is the laser's own
+    video while it runs (:mod:`.live_video`), photos otherwise.
 
     The state is Streaming only while a live view is open, and Idle
     otherwise.
@@ -2279,6 +2283,8 @@ class _WSV2Camera(_CameraDeviceEntity, Camera):
         self._last_photo: bytes | None = None
         self._last_snapshot_time = dt_util.utcnow() - MAX_SNAPSHOT_AGE
         self._live_viewers = 0
+        # The laser's live video (models with one), made for the first viewer
+        self._video: LiveVideo | None = None
         self._thumbnail_seconds: float = THUMBNAIL_REFRESH_DEFAULT
         self._cancel_thumbnail_timer: Any = None
         # Straighten photos with the laser's calibration grid (cameras
@@ -2577,24 +2583,18 @@ class _WSV2Camera(_CameraDeviceEntity, Camera):
         interval = timedelta(seconds=frame_interval / 2)
         self._set_live_viewers(1)
         try:
+            if self.coordinator.model.has_live_video:
+                # The laser's own video while it runs; photos after it
+                # ends or while another camera is live. Closed at once
+                # when the viewer leaves, so the video stops with the last.
+                async with contextlib.aclosing(self._live_video().frames()) as frames:
+                    async for jpeg in frames:
+                        await self._write_frame(response, boundary, jpeg)
             while True:
                 started = time.monotonic()
                 jpeg = await self._image(interval)
                 if jpeg:
-                    # A viewer that stops reading (for example the iOS
-                    # app after its view closes) leaves the write
-                    # waiting; end the live view instead.
-                    await asyncio.wait_for(
-                        response.write(
-                            boundary.encode()
-                            + b"\r\nContent-Type: image/jpeg\r\nContent-Length: "
-                            + str(len(jpeg)).encode()
-                            + b"\r\n\r\n"
-                            + jpeg
-                            + b"\r\n"
-                        ),
-                        timeout=LIVE_WRITE_TIMEOUT,
-                    )
+                    await self._write_frame(response, boundary, jpeg)
                 await asyncio.sleep(
                     max(0.0, frame_interval - (time.monotonic() - started))
                 )
@@ -2608,6 +2608,32 @@ class _WSV2Camera(_CameraDeviceEntity, Camera):
         finally:
             self._set_live_viewers(-1)
         return response
+
+    @staticmethod
+    async def _write_frame(response: web.StreamResponse, boundary: str, jpeg: bytes) -> None:
+        # A viewer that stops reading (for example the iOS app after its
+        # view closes) leaves the write waiting; end the live view instead.
+        await asyncio.wait_for(
+            response.write(
+                boundary.encode()
+                + b"\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                + str(len(jpeg)).encode()
+                + b"\r\n\r\n"
+                + jpeg
+                + b"\r\n"
+            ),
+            timeout=LIVE_WRITE_TIMEOUT,
+        )
+
+    def _live_video(self) -> LiveVideo:
+        """The camera's live video, shared by its viewers."""
+        if self._video is None:
+            camera = self._camera_name
+            protocol = self.coordinator.protocol
+            self._video = LiveVideo(
+                self.hass, lambda: protocol.live_video(camera), f"{camera} camera",
+            )
+        return self._video
 
     def _set_live_viewers(self, change: int) -> None:
         was_streaming = self.is_streaming
