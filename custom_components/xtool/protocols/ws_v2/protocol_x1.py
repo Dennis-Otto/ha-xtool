@@ -303,8 +303,7 @@ class X1WSV2Protocol(M2WSV2Protocol):
         )
         try:
             async with self._session.ws_connect(
-                url, ssl=_ssl_context(), timeout=aiohttp.ClientTimeout(total=15),
-                heartbeat=None, max_msg_size=0,
+                url, ssl=_ssl_context(), heartbeat=None, max_msg_size=0,
             ) as ws:
                 await self.request(
                     X1_PATH_CAMERA_LIVE, "POST", params={"name": camera_name, "action": "start"},
