@@ -165,6 +165,7 @@ One fan entity: Off, Manual speeds 1-4 and the presets **Auto Regular** and **Au
 | Flame alarm | **Warning (per xTool Studio):** with it off, no flame alarm is triggered. Disabled by default. **F2 Ultra UV** attribute `flame_record`: a photo of a fire alarm is stored |
 | Access control | As xTool Studio: each job needs the access-control check at the machine, and autofocus, framing and offline processing are off. Only on the units Studio offers it on, see below. Disabled by default |
 | Device sleep | **V2 firmware, F1 / F2 family.** The laser sleeps when idle (xTool recommends keeping it on) |
+| Smart trial run check | **X1.** Before a job with the 20 W diode, 30 W fiber or 60 W MOPA module, the X1 checks for anomalies first (Studio's setting) |
 
 #### Access control
 
@@ -209,6 +210,18 @@ target:
 data:
   crop_width: 267
   crop_height: 200
+```
+
+#### Action `xtool.feeder_clamp`
+
+Clamps the material in an X1's conveyor feeder for its `thickness` in mm (0-68.9) and `material` (`rigid`, the default, or `flexible`), as Studio does when a thickness is entered in feeder mode. Refused unless a feeder is fitted and the laser is idle; **Release material** lets the material go again.
+
+```yaml
+action: xtool.feeder_clamp
+data:
+  device_id: <the X1's device>
+  thickness: 3
+  material: rigid
 ```
 
 #### Action `xtool.focus`
@@ -271,6 +284,7 @@ The P2's cameras are straightened with its own calibration. Each has Crop preset
 | Wake | **P2.** Wakes a sleeping P2 so its cameras take photos again |
 | Reconnect Bluetooth accessories | **X1.** Available while a paired Bluetooth accessory (the SafetyPro AP2) is not connected. Searches for it for up to 2 minutes and connects it, as Studio's accessory window does. An AP2 that lost its pairing shows up only in pairing mode: hold its power button for 5 seconds until the Bluetooth light blinks |
 | Reboot / Sync time / Quit LightBurn | Restart, set the laser's clock, leave LightBurn standby |
+| Release material | **X1.** The conveyor feeder lets go of the material, as Studio's button. Only with a feeder fitted and the laser idle |
 
 ### Update
 
